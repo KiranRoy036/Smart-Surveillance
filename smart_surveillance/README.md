@@ -378,6 +378,3 @@ Educational Mini Project
 
 ---
 
-# Author
-
-Abhiram S
