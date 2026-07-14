@@ -1,0 +1,29 @@
+# ── Server ────────────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+python-multipart
+
+# ── Database ──────────────────────────────────────────────────────────────────
+psycopg2-binary
+python-dotenv
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+passlib[bcrypt]
+pydantic
+
+# ── AI / Vision ───────────────────────────────────────────────────────────────
+# torch is already installed in the pytorch/pytorch base image — don't reinstall
+ultralytics
+opencv-python-headless    # headless variant: no display needed inside container
+numpy
+
+# ── Tracking / Math ───────────────────────────────────────────────────────────
+scipy
+shapely
+filterpy
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+PyYAML
+requests
+pillow
+psutil

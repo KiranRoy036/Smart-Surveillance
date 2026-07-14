@@ -1,0 +1,6 @@
+{
+  "camera_name": "lab_entry",
+  "scenario": "ZONE_DETECTION",
+  "video": "videos/campus3.mp4",
+  "zone": []
+}

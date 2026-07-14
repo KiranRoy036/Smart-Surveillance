@@ -1,0 +1,634 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/backend/app.py b/backend/app.py
+index d13e83cf6b6419b0c028196477ffd00b5774c8d9..29ca3f28ba769684dc744ccc8763f763a5bed5bb 100644
+--- a/backend/app.py
++++ b/backend/app.py
+@@ -1,85 +1,154 @@
++from __future__ import annotations
++
++import os
++
++from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+ from fastapi.middleware.cors import CORSMiddleware
+-from fastapi import FastAPI, UploadFile, File, Request
+ from fastapi.responses import StreamingResponse
+ from fastapi.staticfiles import StaticFiles
+-import os
++from pydantic import BaseModel, Field
++from psycopg2.extensions import connection
++
++from db.auth import authenticate_user, register_user
++from db.database import close_db_pool, get_db_connection, init_db_pool
++from db.schema import create_tables
+ from streamer import frame_generator, stop_signals
+ 
+ app = FastAPI()
+ 
++
++class RegisterRequest(BaseModel):
++    username: str = Field(min_length=3, max_length=100)
++    password: str = Field(min_length=4, max_length=128)
++    role: str = Field(min_length=3, max_length=20)
++
++
++class LoginRequest(BaseModel):
++    username: str = Field(min_length=1, max_length=100)
++    password: str = Field(min_length=1, max_length=128)
++
++
++@app.on_event("startup")
++def on_startup() -> None:
++    init_db_pool()
++    db_dependency = get_db_connection()
++    conn = next(db_dependency)
++    try:
++        create_tables(conn)
++    finally:
++        db_dependency.close()
++
++
++@app.on_event("shutdown")
++def on_shutdown() -> None:
++    close_db_pool()
++
++
+ app.add_middleware(
+     CORSMiddleware,
+     allow_origins=["*"],
+     allow_credentials=True,
+     allow_methods=["*"],
+     allow_headers=["*"],
+ )
+ 
+ # serve uploaded video files so that cv2 can open them later
+ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ VIDEOS_DIR = os.path.join(PROJECT_ROOT, "videos")
+ # ensure directory exists
+ os.makedirs(VIDEOS_DIR, exist_ok=True)
+ 
+ app.mount("/videos", StaticFiles(directory=VIDEOS_DIR), name="videos")
+ 
+ 
+ @app.get("/")
+ def root():
+     return {"status": "Smart Surveillance Backend Running"}
+ 
++
++@app.post("/api/register")
++def api_register(
++    payload: RegisterRequest,
++    conn: connection = Depends(get_db_connection),
++):
++    role = payload.role.strip().lower()
++    if role not in {"admin", "viewer"}:
++        raise HTTPException(status_code=400, detail="Role must be admin or viewer")
++
++    try:
++        user = register_user(conn, payload.username, payload.password, role)
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++
++    return {"message": "User registered successfully", "user": user}
++
++
++@app.post("/api/login")
++def api_login(
++    payload: LoginRequest,
++    conn: connection = Depends(get_db_connection),
++):
++    user = authenticate_user(conn, payload.username, payload.password)
++    if user is None:
++        raise HTTPException(status_code=401, detail="Invalid username or password")
++
++    return {"message": "Login successful", "user": user}
++
++
+ @app.post("/upload")
+ async def upload_video(file: UploadFile = File(...)):
+     """Receive a video file from the frontend and save to the videos folder.
+ 
+     Returns a relative path that can be supplied as the ``video`` parameter
+     when starting a scenario.  The frontend will include this path in the
+     query string; ``cv2.VideoCapture`` can open it since the working directory
+     is the project root.
+     """
+     dest_path = os.path.join(VIDEOS_DIR, file.filename)
+     # overwrite if already exists
+     with open(dest_path, "wb") as f:
+         content = await file.read()
+         f.write(content)
+ 
+     return {"location": f"videos/{file.filename}"}
+ 
++
+ @app.post("/stop")
+ async def stop_stream(token: str):
+     """Signal a running stream identified by *token* to terminate.
+ 
+     The frontend generates a random token when it starts a scenario and
+     includes it as a query parameter.  Sending a POST to this endpoint with
+     the same token sets a flag that the streaming generator monitors and
+     breaks out immediately.  This allows the UI to stop a video even if the
+     browser connection remains open for some reason.
+     """
+     stop_signals[token] = True
+     return {"stopped": True}
+ 
++
+ @app.get("/stream/{scenario}")
+ def stream_video(
+     request: Request,
+     scenario: str,
+     line: str | None = None,
+     restricted_point: str | None = None,
+     video: str | None = None,
+     token: str | None = None,
+ ):
+     """Return a video stream processed by the chosen scenario.
+ 
+     Optional query parameters allow the frontend to override configuration
+     values without editing the JSON files.  Supported overrides:
+ 
+     * ``line``: four comma separated ints ``x1,y1,x2,y2`` for line crossing
+     * ``restricted_point``: two comma separated ints ``x,y`` to choose side
+     * ``video``: path or URL of the video/source to use instead of the
+       value stored in the config file (e.g. camera index or file path).
+     """
+ 
+     # forward an optional token so that the frontend can request a
+     # running stream be stopped explicitly (see /stop below).
+     return StreamingResponse(
+         frame_generator(request, scenario, line, restricted_point, video, token),
+         media_type="multipart/x-mixed-replace; boundary=frame"
+diff --git a/backend/db/__init__.py b/backend/db/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..23df6abcea6cb39787384f76e9245e15aaed4d91
+--- /dev/null
++++ b/backend/db/__init__.py
+@@ -0,0 +1,14 @@
++"""Database package exports."""
++
++from db.auth import authenticate_user, register_user
++from db.database import close_db_pool, get_db_connection, init_db_pool
++from db.schema import create_tables
++
++__all__ = [
++    "authenticate_user",
++    "register_user",
++    "init_db_pool",
++    "close_db_pool",
++    "get_db_connection",
++    "create_tables",
++]
+diff --git a/backend/db/auth.py b/backend/db/auth.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f97ce62190ee4ba10c8805450380e7cce2f8bac
+--- /dev/null
++++ b/backend/db/auth.py
+@@ -0,0 +1,65 @@
++"""User registration and authentication backed by PostgreSQL."""
++
++from __future__ import annotations
++
++from psycopg2 import errors
++from psycopg2.extensions import connection
++from passlib.context import CryptContext
++
++pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
++
++
++def register_user(conn: connection, username: str, password: str, role: str) -> dict:
++    """Create a new user with hashed password."""
++    password_hash = pwd_context.hash(password)
++
++    try:
++        with conn.cursor() as cursor:
++            cursor.execute(
++                """
++                INSERT INTO users (username, password_hash, role)
++                VALUES (%s, %s, %s)
++                RETURNING id, username, role, created_at
++                """,
++                (username.strip(), password_hash, role.strip()),
++            )
++            row = cursor.fetchone()
++        conn.commit()
++    except errors.UniqueViolation as exc:
++        conn.rollback()
++        raise ValueError("Username already exists") from exc
++
++    return {
++        "id": row[0],
++        "username": row[1],
++        "role": row[2],
++        "created_at": row[3].isoformat() if row[3] else None,
++    }
++
++
++def authenticate_user(conn: connection, username: str, password: str) -> dict | None:
++    """Validate credentials and return user info on success."""
++    with conn.cursor() as cursor:
++        cursor.execute(
++            """
++            SELECT id, username, password_hash, role, created_at
++            FROM users
++            WHERE username = %s
++            LIMIT 1
++            """,
++            (username.strip(),),
++        )
++        row = cursor.fetchone()
++
++    if row is None:
++        return None
++
++    if not pwd_context.verify(password, row[2]):
++        return None
++
++    return {
++        "id": row[0],
++        "username": row[1],
++        "role": row[3],
++        "created_at": row[4].isoformat() if row[4] else None,
++    }
+diff --git a/backend/db/database.py b/backend/db/database.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4be5695a676b82304f5af067ca31e2281a261a19
+--- /dev/null
++++ b/backend/db/database.py
+@@ -0,0 +1,76 @@
++"""PostgreSQL connection pooling utilities."""
++
++from __future__ import annotations
++
++import os
++from collections.abc import Generator
++
++from psycopg2.extensions import connection
++from psycopg2.pool import SimpleConnectionPool
++
++DEFAULT_DATABASE_URL = "postgresql://surveillance_user:admin@localhost:5432/surveillance"
++
++
++class DatabasePool:
++    """Global PostgreSQL connection pool manager."""
++
++    def __init__(self) -> None:
++        self._pool: SimpleConnectionPool | None = None
++
++    def initialize(self) -> None:
++        """Initialize pool only once."""
++        if self._pool is not None:
++            return
++
++        database_url = os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
++        self._pool = SimpleConnectionPool(
++            minconn=1,
++            maxconn=10,
++            dsn=database_url,
++        )
++
++    def close(self) -> None:
++        """Close all pooled connections."""
++        if self._pool is not None:
++            self._pool.closeall()
++            self._pool = None
++
++    def acquire(self) -> connection:
++        """Borrow one connection from pool."""
++        if self._pool is None:
++            self.initialize()
++
++        if self._pool is None:
++            raise RuntimeError("Database pool is not initialized")
++
++        return self._pool.getconn()
++
++    def release(self, conn: connection) -> None:
++        """Return one connection to pool."""
++        if self._pool is None:
++            conn.close()
++            return
++
++        self._pool.putconn(conn)
++
++
++_db_pool = DatabasePool()
++
++
++def init_db_pool() -> None:
++    """Initialize global DB pool."""
++    _db_pool.initialize()
++
++
++def close_db_pool() -> None:
++    """Close global DB pool."""
++    _db_pool.close()
++
++
++def get_db_connection() -> Generator[connection, None, None]:
++    """FastAPI dependency that yields PostgreSQL connection."""
++    conn = _db_pool.acquire()
++    try:
++        yield conn
++    finally:
++        _db_pool.release(conn)
+diff --git a/backend/db/init_db.py b/backend/db/init_db.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..646b5e4ef521ad22784d66482ece82247e97eb0e
+--- /dev/null
++++ b/backend/db/init_db.py
+@@ -0,0 +1,26 @@
++"""Initialize PostgreSQL tables.
++
++Usage:
++    python -m db.init_db
++"""
++
++from __future__ import annotations
++
++from db.database import close_db_pool, get_db_connection, init_db_pool
++from db.schema import create_tables
++
++
++def main() -> None:
++    init_db_pool()
++    db_dependency = get_db_connection()
++    conn = next(db_dependency)
++    try:
++        create_tables(conn)
++        print("Database schema initialized successfully")
++    finally:
++        db_dependency.close()
++        close_db_pool()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/backend/db/schema.py b/backend/db/schema.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..be523b86bade349846b17d8067b54feaa41a69d2
+--- /dev/null
++++ b/backend/db/schema.py
+@@ -0,0 +1,22 @@
++"""Database schema creation for PostgreSQL."""
++
++from __future__ import annotations
++
++from psycopg2.extensions import connection
++
++CREATE_USERS_TABLE = """
++CREATE TABLE IF NOT EXISTS users (
++    id SERIAL PRIMARY KEY,
++    username TEXT UNIQUE NOT NULL,
++    password_hash TEXT NOT NULL,
++    role TEXT NOT NULL,
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++)
++"""
++
++
++def create_tables(conn: connection) -> None:
++    """Create required backend tables."""
++    with conn.cursor() as cursor:
++        cursor.execute(CREATE_USERS_TABLE)
++    conn.commit()
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 131f45d06f461884f74e1329d4cc09c04614992d..112fdd7e20e8a08a79f14a67cc2e0871c0e1b323 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -1,4 +1,6 @@
+ fastapi
+ uvicorn
+ python-multipart
+ opencv-python
++psycopg2-binary
++passlib[bcrypt]
+diff --git a/frontend/src/pages/Home.tsx b/frontend/src/pages/Home.tsx
+index 77bc30e101ca5e3d19a40057d37b31ed8e180bd6..d9a826431a16639ae2bf39484f7d31cbebef8f1d 100644
+--- a/frontend/src/pages/Home.tsx
++++ b/frontend/src/pages/Home.tsx
+@@ -1,86 +1,99 @@
+ import { motion } from "framer-motion"
+ import { useState } from "react"
++import { useNavigate } from "react-router-dom"
++
++const TEMP_CREDENTIALS = {
++  username: "admin",
++  password: "admin"
++}
+ 
+ export default function Home() {
++  const navigate = useNavigate()
+   const [loginMode, setLoginMode] = useState<"landing" | "admin" | "viewer" | "register" | null>(null)
+   const [adminUsername, setAdminUsername] = useState("")
+   const [adminPassword, setAdminPassword] = useState("")
+   const [viewerUsername, setViewerUsername] = useState("")
+   const [viewerPassword, setViewerPassword] = useState("")
+   const [loading, setLoading] = useState(false)
+   const [error, setError] = useState("")
+   const [hoveredAdmin, setHoveredAdmin] = useState(false)
+   const [hoveredViewer, setHoveredViewer] = useState(false)
+   const [hoveredRegister, setHoveredRegister] = useState(false)
+   const [regUsername, setRegUsername] = useState("")
+   const [regPassword, setRegPassword] = useState("")
+ 
+   const handleAdminClick = () => {
+     setLoginMode("admin")
+     setError("")
+   }
+ 
+   const handleViewerClick = () => {
+     setLoginMode("viewer")
+     setError("")
+   }
+ 
+   const handleBack = () => {
+     setLoginMode(null)
+     setAdminUsername("")
+     setAdminPassword("")
+     setViewerUsername("")
+     setViewerPassword("")
+     setError("")
+   }
+ 
+   const handleAdminLogin = (e: React.FormEvent) => {
+     e.preventDefault()
+     setError("")
+     setLoading(true)
+     setTimeout(() => {
+-      if (adminUsername && adminPassword) {
+-        console.log("Admin login:", { adminUsername, adminPassword })
++      if (
++        adminUsername.trim() === TEMP_CREDENTIALS.username
++        && adminPassword === TEMP_CREDENTIALS.password
++      ) {
++        navigate("/admin-dashboard")
+         setLoading(false)
+       } else {
+-        setError("Please enter username and password")
++        setError("Invalid credentials. Use admin / admin.")
+         setLoading(false)
+       }
+     }, 1000)
+   }
+ 
+   const handleViewerLogin = (e: React.FormEvent) => {
+     e.preventDefault()
+     setError("")
+     setLoading(true)
+     setTimeout(() => {
+-      if (viewerUsername && viewerPassword) {
+-        console.log("Viewer login:", { viewerUsername, viewerPassword })
++      if (
++        viewerUsername.trim() === TEMP_CREDENTIALS.username
++        && viewerPassword === TEMP_CREDENTIALS.password
++      ) {
++        navigate("/viewer-dashboard")
+         setLoading(false)
+       } else {
+-        setError("Please enter username and password")
++        setError("Invalid credentials. Use admin / admin.")
+         setLoading(false)
+       }
+     }, 1000)
+   }
+ 
+   const handleRegisterClick = () => {
+     setLoginMode("register")
+     setError("")
+   }
+ 
+   const handleRegisterSubmit = (e: React.FormEvent) => {
+     e.preventDefault()
+     setError("")
+     setLoading(true)
+     setTimeout(() => {
+       if (regUsername && regPassword) {
+         console.log("Register:", { regUsername })
+         setLoading(false)
+       } else {
+         setError("Please enter username and password")
+         setLoading(false)
+       }
+     }, 1000)
+   }
+ 
+@@ -299,50 +312,54 @@ export default function Home() {
+                   }}
+                   style={styles.input}
+                   placeholder="Enter your username or email"
+                   required
+                 />
+               </div>
+ 
+               <div style={styles.formGroup}>
+                 <label style={styles.label}>Password</label>
+                 <input
+                   type="password"
+                   value={loginMode === "admin" ? adminPassword : loginMode === "viewer" ? viewerPassword : regPassword}
+                   onChange={(e) => {
+                     if (loginMode === "admin") setAdminPassword(e.target.value)
+                     else if (loginMode === "viewer") setViewerPassword(e.target.value)
+                     else setRegPassword(e.target.value)
+                   }}
+                   style={styles.input}
+                   placeholder="Enter your password"
+                   required
+                 />
+               </div>
+ 
+               {error && <div style={styles.error}>{error}</div>}
+ 
++              {(loginMode === "admin" || loginMode === "viewer") && (
++                <div style={styles.helperText}>Temporary login: admin / admin</div>
++              )}
++
+               <motion.button
+                 type="submit"
+                 disabled={loading}
+                 whileHover={{ scale: 1.05 }}
+                 whileTap={{ scale: 0.95 }}
+                 style={{
+                   ...styles.submitBtn,
+                   background: loginMode === "admin"
+                     ? "linear-gradient(135deg, #ff8181 0%, #80001a 100%)"
+                     : loginMode === "viewer" ? "linear-gradient(135deg, #2563eb 0%, #06b6d4 100%)" : "linear-gradient(135deg, #10b981 0%, #059669 100%)"
+                 }}
+               >
+                 {loading ? "Processing..." : loginMode === "admin" ? "Login as Admin" : loginMode === "viewer" ? "Login as Viewer" : "Register"}
+               </motion.button>
+             </motion.form>
+ 
+             <motion.p
+               initial={{ opacity: 0 }}
+               animate={{ opacity: 1 }}
+               transition={{ delay: 0.6 }}
+               style={styles.backLink}
+             >
+               <a onClick={handleBack} style={styles.link}>
+                 Back to Home
+               </a>
+@@ -526,50 +543,59 @@ const styles: any = {
+     fontWeight: 500,
+     color: "#e2e8f0"
+   },
+ 
+   input: {
+     padding: "12px 16px",
+     borderRadius: "8px",
+     border: "1px solid rgba(255, 255, 255, 0.2)",
+     background: "rgba(30, 41, 59, 0.8)",
+     color: "white",
+     fontSize: "1rem",
+     transition: "all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)",
+     outline: "none",
+     boxSizing: "border-box" as const
+   },
+ 
+   error: {
+     color: "#ff6b6b",
+     fontSize: "0.9rem",
+     padding: "10px",
+     background: "rgba(255, 107, 107, 0.1)",
+     borderRadius: "6px",
+     border: "1px solid rgba(255, 107, 107, 0.3)"
+   },
+ 
++  helperText: {
++    color: "#bfdbfe",
++    fontSize: "0.9rem",
++    background: "rgba(37, 99, 235, 0.12)",
++    border: "1px solid rgba(37, 99, 235, 0.35)",
++    borderRadius: "6px",
++    padding: "10px"
++  },
++
+   submitBtn: {
+     padding: "14px 28px",
+     marginTop: 10,
+     borderRadius: 8,
+     border: "none",
+     color: "white",
+     fontSize: "1.1rem",
+     fontfamily: "Google Sans Bold, sans-serif",
+     fontWeight: 600,
+     cursor: "pointer",
+     transition: "all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)"
+   },
+ 
+   backLink: {
+     marginTop: 20,
+     fontSize: "0.95rem",
+     color: "#cbd5e1"
+   },
+ 
+   link: {
+     color: "#2563eb",
+     textDecoration: "none",
+     cursor: "pointer",
+     transition: "color 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)"
+   }
+ 
+EOF
+)

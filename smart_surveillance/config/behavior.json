@@ -1,0 +1,13 @@
+{
+  "camera_name": "open_ground_1",
+  "scenario": "BEHAVIOR",
+  "video": "videos/campus2.mp4",
+
+  "confidence": 0.35,
+
+  "min_running_speed": 2.5,
+  "min_distance": 2.0,
+
+  "loiter_time": 10,
+  "loiter_radius": 0.6
+}
